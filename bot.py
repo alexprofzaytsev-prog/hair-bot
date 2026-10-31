@@ -24,6 +24,7 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -44,6 +45,7 @@ KNOWLEDGE_FILE = Path(__file__).with_name("knowledge.txt")
 PRICE_DIR = Path(__file__).with_name("price")
 PRICE_BUTTON = "📄 Прайс-лист"
 ORDER_BUTTON = "🛒 Оформить заказ"
+SEMINAR_BUTTON = "🎓 Семинары"
 MANAGER_BUTTON = "📞 Связаться с менеджером"
 CANCEL_BUTTON = "❌ Отменить"
 PICKUP_BUTTON = "🏪 Самовывоз (ул. Спартака, 13)"
@@ -61,6 +63,15 @@ def load_price_ids() -> dict:
 
 
 price_file_ids = load_price_ids()
+
+# Афиши семинаров: список file_id картинок в Telegram
+SEMINARS_FILE = Path(__file__).with_name("seminars.json")
+
+
+def load_seminars() -> list:
+    if SEMINARS_FILE.exists():
+        return json.loads(SEMINARS_FILE.read_text(encoding="utf-8"))
+    return []
 NO_ANSWER = "Спасибо за ваше сообщение! Я передал его менеджеру — вам ответят в ближайшее время 🙌"
 CANT_ANSWER_MARK = "[НЕ ЗНАЮ]"
 
@@ -78,7 +89,7 @@ def load_faq(text: str) -> dict:
 def main_keyboard() -> ReplyKeyboardMarkup:
     faq = load_faq(load_knowledge())
     buttons = [
-        [KeyboardButton(text=PRICE_BUTTON)],
+        [KeyboardButton(text=PRICE_BUTTON), KeyboardButton(text=SEMINAR_BUTTON)],
         [KeyboardButton(text=ORDER_BUTTON), KeyboardButton(text=MANAGER_BUTTON)],
     ] + [[KeyboardButton(text=q)] for q in faq]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -168,6 +179,36 @@ async def contact_manager(message: Message):
         f"Менеджер на связи с 9:00 до 18:00.\n📞 Телефон: {MANAGER_PHONE}\n\n"
         "Или напишите ему в Telegram 👇",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button]]),
+    )
+
+
+# ---------- Семинары ----------
+
+@dp.message(F.text == SEMINAR_BUTTON)
+async def seminars(message: Message, bot: Bot):
+    photos = load_seminars()
+    signup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✍️ Записаться на семинар", url=f"https://t.me/{MANAGER_USERNAME}")
+    ]])
+    if not photos:
+        await message.answer(
+            "Сейчас нет запланированных семинаров. Следите за новостями — "
+            f"или уточните у менеджера: {MANAGER_PHONE}",
+            reply_markup=signup,
+        )
+        return
+    await message.answer("🎓 Актуальные семинары 👇")
+    await bot.send_chat_action(message.chat.id, "upload_photo")
+    # Telegram отправляет альбомом не больше 10 картинок за раз
+    for i in range(0, len(photos), 10):
+        chunk = photos[i:i + 10]
+        if len(chunk) == 1:
+            await message.answer_photo(chunk[0])
+        else:
+            await message.answer_media_group([InputMediaPhoto(media=f) for f in chunk])
+    await message.answer(
+        f"Чтобы записаться, напишите менеджеру или позвоните: {MANAGER_PHONE}",
+        reply_markup=signup,
     )
 
 
@@ -386,6 +427,11 @@ async def answer(message: Message, bot: Bot):
     # 1. Нажали кнопку — точное совпадение с вопросом
     if text in faq:
         await message.answer(faq[text])
+        return
+
+    # Спрашивают про семинары/обучение — показываем афиши
+    if re.search(r"семинар|обучени|мастер-?класс", text.lower()):
+        await seminars(message, bot)
         return
 
     # 2. Спрашиваем ИИ (если подключён)
