@@ -17,7 +17,15 @@ from pathlib import Path
 import anthropic
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -131,11 +139,31 @@ async def start(message: Message):
     )
 
 
+def price_catalogs():
+    """Список каталогов: файлы из папки price, а если её нет — запомненные file_id."""
+    files = {p.name: p for p in sorted(PRICE_DIR.glob("*")) if p.is_file() and not p.name.startswith(".")}
+    return files, list(files) or list(price_file_ids)
+
+
+def catalog_title(name: str) -> str:
+    """Catalogue_ESTEL_июль_26.pdf -> ESTEL июль 26"""
+    stem = re.sub(r"^(catalogue|catalog|каталог)[_ ]*", "", Path(name).stem, flags=re.I)
+    return stem.replace("_", " ").strip()
+
+
+async def send_catalog(message: Message, bot: Bot, name: str, files: dict):
+    await bot.send_chat_action(message.chat.id, "upload_document")
+    # Файл загружается в Telegram один раз, дальше отправляется мгновенно по его file_id
+    cached = price_file_ids.get(name)
+    sent = await message.answer_document(cached or FSInputFile(files[name]))
+    if not cached:
+        price_file_ids[name] = sent.document.file_id
+        PRICE_IDS_FILE.write_text(json.dumps(price_file_ids, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 @dp.message(F.text == PRICE_BUTTON)
 async def send_price(message: Message, bot: Bot):
-    # Если в папке price есть файлы — отправляем их, иначе берём запомненные file_id
-    files = {p.name: p for p in sorted(PRICE_DIR.glob("*")) if p.is_file() and not p.name.startswith(".")}
-    names = list(files) or list(price_file_ids)
+    files, names = price_catalogs()
     if not names:
         await message.answer(NO_ANSWER)
         user = message.from_user
@@ -145,15 +173,32 @@ async def send_price(message: Message, bot: Bot):
             f"От: {user.full_name} (@{user.username})\nID клиента: {user.id}",
         )
         return
-    await message.answer("Отправляю актуальные каталоги с ценами 👇 Это может занять немного времени.")
-    for name in names:
-        await bot.send_chat_action(message.chat.id, "upload_document")
-        # Файл загружается в Telegram один раз, дальше отправляется мгновенно по его file_id
-        cached = price_file_ids.get(name)
-        sent = await message.answer_document(cached or FSInputFile(files[name]))
-        if not cached:
-            price_file_ids[name] = sent.document.file_id
-            PRICE_IDS_FILE.write_text(json.dumps(price_file_ids, ensure_ascii=False, indent=2), encoding="utf-8")
+    if len(names) == 1:
+        await send_catalog(message, bot, names[0], files)
+        return
+    # Несколько брендов — даём выбрать нужный каталог
+    buttons = [[InlineKeyboardButton(text=f"📘 {catalog_title(n)}", callback_data=f"price:{i}")]
+               for i, n in enumerate(names)]
+    buttons.append([InlineKeyboardButton(text="📚 Все каталоги", callback_data="price:all")])
+    await message.answer("Выберите бренд:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@dp.callback_query(F.data.startswith("price:"))
+async def price_chosen(callback: CallbackQuery, bot: Bot):
+    files, names = price_catalogs()
+    choice = callback.data.split(":", 1)[1]
+    if choice == "all":
+        chosen = names
+    elif choice.isdigit() and int(choice) < len(names):
+        chosen = [names[int(choice)]]
+    else:
+        chosen = []
+    await callback.answer()
+    if not chosen:
+        await callback.message.answer("Каталог обновился — нажмите «📄 Прайс-лист» ещё раз.")
+        return
+    for name in chosen:
+        await send_catalog(callback.message, bot, name, files)
 
 
 @dp.message(F.chat.id == ADMIN_ID, F.reply_to_message)
