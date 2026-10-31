@@ -17,6 +17,8 @@ from pathlib import Path
 import anthropic
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
@@ -41,6 +43,13 @@ KNOWLEDGE_FILE = Path(__file__).with_name("knowledge.txt")
 # Положите в эту папку файлы прайс-листов (PDF, Excel и т.д.) — бот отправит их по кнопке
 PRICE_DIR = Path(__file__).with_name("price")
 PRICE_BUTTON = "📄 Прайс-лист"
+ORDER_BUTTON = "🛒 Оформить заказ"
+MANAGER_BUTTON = "📞 Связаться с менеджером"
+CANCEL_BUTTON = "❌ Отменить"
+PICKUP_BUTTON = "🏪 Самовывоз (ул. Спартака, 13)"
+# Кому клиенты пишут по кнопке «Связаться с менеджером»
+MANAGER_USERNAME = "Zalexpro1"
+MANAGER_PHONE = "+7 (903) 632-71-80"
 # Здесь бот запоминает file_id каталогов в Telegram. С этим файлом сами PDF на сервере не нужны.
 PRICE_IDS_FILE = Path(__file__).with_name("price_ids.json")
 
@@ -66,9 +75,18 @@ def load_faq(text: str) -> dict:
     return {q.strip(): a.strip() for q, a in pairs}
 
 
-def faq_keyboard(faq: dict) -> ReplyKeyboardMarkup:
-    buttons = [[KeyboardButton(text=PRICE_BUTTON)]] + [[KeyboardButton(text=q)] for q in faq]
+def main_keyboard() -> ReplyKeyboardMarkup:
+    faq = load_faq(load_knowledge())
+    buttons = [
+        [KeyboardButton(text=PRICE_BUTTON)],
+        [KeyboardButton(text=ORDER_BUTTON), KeyboardButton(text=MANAGER_BUTTON)],
+    ] + [[KeyboardButton(text=q)] for q in faq]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+
+def cancel_keyboard(*extra: KeyboardButton) -> ReplyKeyboardMarkup:
+    rows = [[b] for b in extra] + [[KeyboardButton(text=CANCEL_BUTTON)]]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def find_by_keywords(question: str, faq: dict):
@@ -111,14 +129,16 @@ async def ask_claude(user_id: int, question: str):
     return answer
 
 
-async def notify_admin(bot: Bot, text: str):
+async def notify_admin(bot: Bot, text: str) -> bool:
     """Отправляет уведомление владельцу. Ошибка здесь не должна ломать ответ клиенту."""
     if not ADMIN_ID:
-        return
+        return False
     try:
         await bot.send_message(ADMIN_ID, text)
+        return True
     except Exception as e:
         logging.error("Не удалось отправить уведомление на ADMIN_ID=%s: %s", ADMIN_ID, e)
+        return False
 
 
 dp = Dispatcher()
@@ -130,13 +150,153 @@ async def my_id(message: Message):
 
 
 @dp.message(CommandStart())
-async def start(message: Message):
-    faq = load_faq(load_knowledge())
+async def start(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "Здравствуйте! 👋 Я помощник магазина профессиональной косметики для волос. "
         "Выберите вопрос ниже или напишите свой.",
-        reply_markup=faq_keyboard(faq),
+        reply_markup=main_keyboard(),
     )
+
+
+# ---------- Связь с менеджером ----------
+
+@dp.message(F.text == MANAGER_BUTTON)
+async def contact_manager(message: Message):
+    button = InlineKeyboardButton(text="✍️ Написать в Telegram", url=f"https://t.me/{MANAGER_USERNAME}")
+    await message.answer(
+        f"Менеджер на связи с 9:00 до 18:00.\n📞 Телефон: {MANAGER_PHONE}\n\n"
+        "Или напишите ему в Telegram 👇",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button]]),
+    )
+
+
+# ---------- Оформление заказа (по шагам) ----------
+
+class Order(StatesGroup):
+    salon = State()
+    phone = State()
+    address = State()
+    items = State()
+    confirm = State()
+
+
+@dp.message(F.text == CANCEL_BUTTON)
+async def cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Хорошо, отменил. Чем ещё могу помочь?", reply_markup=main_keyboard())
+
+
+@dp.message(F.text == ORDER_BUTTON)
+async def order_start(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(Order.salon)
+    await message.answer(
+        "Оформим заказ — это займёт минуту 🙂\n\n"
+        "Шаг 1 из 4. Как называется ваш салон и как к вам обращаться?",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@dp.message(Order.salon, F.text)
+async def order_salon(message: Message, state: FSMContext):
+    await state.update_data(salon=message.text)
+    await state.set_state(Order.phone)
+    await message.answer(
+        "Шаг 2 из 4. Ваш номер телефона для связи? "
+        "Нажмите кнопку ниже или напишите номер.",
+        reply_markup=cancel_keyboard(KeyboardButton(text="📱 Отправить мой номер", request_contact=True)),
+    )
+
+
+@dp.message(Order.phone, F.contact | F.text)
+async def order_phone(message: Message, state: FSMContext):
+    phone = message.contact.phone_number if message.contact else message.text
+    await state.update_data(phone=phone)
+    await state.set_state(Order.address)
+    await message.answer(
+        "Шаг 3 из 4. Адрес доставки? Или выберите самовывоз.\n"
+        "Доставка — при заказе от 5 000 ₽.",
+        reply_markup=cancel_keyboard(KeyboardButton(text=PICKUP_BUTTON)),
+    )
+
+
+@dp.message(Order.address, F.text)
+async def order_address(message: Message, state: FSMContext):
+    await state.update_data(address=message.text)
+    await state.set_state(Order.items)
+    await message.answer(
+        "Шаг 4 из 4. Напишите, что хотите заказать: бренд, название, объём и количество. "
+        "Можно списком в одном сообщении.\n\n"
+        "Например:\nESTEL De Luxe 7/1 — 10 шт\nCouture шампунь 1000 мл — 2 шт",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+def order_text(data: dict) -> str:
+    return (
+        f"🏢 Салон: {data['salon']}\n"
+        f"📞 Телефон: {data['phone']}\n"
+        f"📍 Адрес: {data['address']}\n\n"
+        f"🧴 Товары:\n{data['items']}"
+    )
+
+
+@dp.message(Order.items, F.text)
+async def order_items(message: Message, state: FSMContext):
+    await state.update_data(items=message.text)
+    await state.set_state(Order.confirm)
+    buttons = [
+        [InlineKeyboardButton(text="✅ Отправить заказ", callback_data="order:send")],
+        [InlineKeyboardButton(text="✏️ Заполнить заново", callback_data="order:restart")],
+    ]
+    await message.answer(
+        "Проверьте, пожалуйста, ваш заказ:\n\n" + order_text(await state.get_data()),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@dp.callback_query(Order.confirm, F.data == "order:send")
+async def order_send(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await state.clear()
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    user = callback.from_user
+    delivered = await notify_admin(
+        bot,
+        f"🛒 НОВЫЙ ЗАКАЗ\nОт: {user.full_name} (@{user.username})\nID клиента: {user.id}\n\n"
+        f"{order_text(data)}\n\n"
+        "Чтобы ответить клиенту — сделайте «Ответить» (reply) на это сообщение.",
+    )
+    if delivered:
+        text = ("✅ Спасибо! Заказ передан менеджеру. "
+                "Мы свяжемся с вами для подтверждения в рабочее время (9:00–18:00).")
+    else:
+        text = f"Извините, не удалось отправить заказ. Пожалуйста, позвоните нам: {MANAGER_PHONE}"
+    await callback.message.answer(text, reply_markup=main_keyboard())
+
+
+@dp.callback_query(F.data == "order:restart")
+async def order_restart(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.clear()
+    await state.set_state(Order.salon)
+    await callback.message.answer(
+        "Шаг 1 из 4. Как называется ваш салон и как к вам обращаться?",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "order:send")
+async def order_expired(callback: CallbackQuery):
+    await callback.answer("Этот заказ уже отправлен или устарел", show_alert=True)
+
+
+@dp.message(Order.confirm)
+async def order_confirm_hint(message: Message):
+    await message.answer("Нажмите «✅ Отправить заказ» в сообщении выше или «❌ Отменить».")
 
 
 def price_catalogs():
