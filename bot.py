@@ -307,7 +307,7 @@ def price_catalogs():
 
 def catalog_title(name: str) -> str:
     """Catalogue_ESTEL_июль_26.pdf -> ESTEL июль 26"""
-    stem = re.sub(r"^(catalogue|catalog|каталог)[_ ]*", "", Path(name).stem, flags=re.I)
+    stem = re.sub(r"^(catalogue|catalog|каталог|прайс|price)[_ ]*", "", Path(name).stem, flags=re.I)
     return stem.replace("_", " ").strip()
 
 
