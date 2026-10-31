@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+from datetime import date
 from pathlib import Path
 
 import anthropic
@@ -46,6 +47,7 @@ PRICE_DIR = Path(__file__).with_name("price")
 PRICE_BUTTON = "📄 Прайс-лист"
 ORDER_BUTTON = "🛒 Оформить заказ"
 SEMINAR_BUTTON = "🎓 Семинары"
+PROMO_BUTTON = "🔥 Акции"
 MANAGER_BUTTON = "📞 Связаться с менеджером"
 CANCEL_BUTTON = "❌ Отменить"
 PICKUP_BUTTON = "🏪 Самовывоз (ул. Спартака, 13)"
@@ -64,14 +66,23 @@ def load_price_ids() -> dict:
 
 price_file_ids = load_price_ids()
 
-# Афиши семинаров: список file_id картинок в Telegram
+# Афиши семинаров и акций: картинки в Telegram (file_id) и дата, до которой их показывать
 SEMINARS_FILE = Path(__file__).with_name("seminars.json")
+PROMOS_FILE = Path(__file__).with_name("promotions.json")
 
 
-def load_seminars() -> list:
-    if SEMINARS_FILE.exists():
-        return json.loads(SEMINARS_FILE.read_text(encoding="utf-8"))
-    return []
+def load_posters(path: Path) -> list:
+    """Возвращает file_id только актуальных афиш: прошедшие (по полю until) скрываются сами."""
+    if not path.exists():
+        return []
+    today = date.today().isoformat()
+    result = []
+    for item in json.loads(path.read_text(encoding="utf-8")):
+        if isinstance(item, str):
+            result.append(item)
+        elif not item.get("until") or item["until"] >= today:
+            result.append(item["file_id"])
+    return result
 NO_ANSWER = "Спасибо за ваше сообщение! Я передал его менеджеру — вам ответят в ближайшее время 🙌"
 CANT_ANSWER_MARK = "[НЕ ЗНАЮ]"
 
@@ -89,7 +100,8 @@ def load_faq(text: str) -> dict:
 def main_keyboard() -> ReplyKeyboardMarkup:
     faq = load_faq(load_knowledge())
     buttons = [
-        [KeyboardButton(text=PRICE_BUTTON), KeyboardButton(text=SEMINAR_BUTTON)],
+        [KeyboardButton(text=PRICE_BUTTON)],
+        [KeyboardButton(text=PROMO_BUTTON), KeyboardButton(text=SEMINAR_BUTTON)],
         [KeyboardButton(text=ORDER_BUTTON), KeyboardButton(text=MANAGER_BUTTON)],
     ] + [[KeyboardButton(text=q)] for q in faq]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -182,22 +194,15 @@ async def contact_manager(message: Message):
     )
 
 
-# ---------- Семинары ----------
+# ---------- Семинары и акции ----------
 
-@dp.message(F.text == SEMINAR_BUTTON)
-async def seminars(message: Message, bot: Bot):
-    photos = load_seminars()
-    signup = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✍️ Записаться на семинар", url=f"https://t.me/{MANAGER_USERNAME}")
+def manager_button(text: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=text, url=f"https://t.me/{MANAGER_USERNAME}")
     ]])
-    if not photos:
-        await message.answer(
-            "Сейчас нет запланированных семинаров. Следите за новостями — "
-            f"или уточните у менеджера: {MANAGER_PHONE}",
-            reply_markup=signup,
-        )
-        return
-    await message.answer("🎓 Актуальные семинары 👇")
+
+
+async def send_posters(message: Message, bot: Bot, photos: list):
     await bot.send_chat_action(message.chat.id, "upload_photo")
     # Telegram отправляет альбомом не больше 10 картинок за раз
     for i in range(0, len(photos), 10):
@@ -206,9 +211,42 @@ async def seminars(message: Message, bot: Bot):
             await message.answer_photo(chunk[0])
         else:
             await message.answer_media_group([InputMediaPhoto(media=f) for f in chunk])
+
+
+@dp.message(F.text == SEMINAR_BUTTON)
+async def seminars(message: Message, bot: Bot):
+    photos = load_posters(SEMINARS_FILE)
+    signup = manager_button("✍️ Записаться на семинар")
+    if not photos:
+        await message.answer(
+            "Сейчас нет запланированных семинаров. Следите за новостями — "
+            f"или уточните у менеджера: {MANAGER_PHONE}",
+            reply_markup=signup,
+        )
+        return
+    await message.answer("🎓 Актуальные семинары 👇")
+    await send_posters(message, bot, photos)
     await message.answer(
         f"Чтобы записаться, напишите менеджеру или позвоните: {MANAGER_PHONE}",
         reply_markup=signup,
+    )
+
+
+@dp.message(F.text == PROMO_BUTTON)
+async def promotions(message: Message, bot: Bot):
+    photos = load_posters(PROMOS_FILE)
+    if not photos:
+        await message.answer(
+            "Сейчас действующих акций нет — загляните позже 🙂 "
+            "Актуальные цены — в разделе «📄 Прайс-лист».",
+        )
+        return
+    await message.answer("🔥 Действующие акции 👇")
+    await send_posters(message, bot, photos)
+    await message.answer(
+        "Чтобы воспользоваться акцией, оформите заказ кнопкой «🛒 Оформить заказ» "
+        "или напишите менеджеру.",
+        reply_markup=manager_button("✍️ Написать менеджеру"),
     )
 
 
@@ -432,6 +470,9 @@ async def answer(message: Message, bot: Bot):
     # Спрашивают про семинары/обучение — показываем афиши
     if re.search(r"семинар|обучени|мастер-?класс", text.lower()):
         await seminars(message, bot)
+        return
+    if re.search(r"акци|скидк|распродаж|спецпредлож", text.lower()):
+        await promotions(message, bot)
         return
 
     # 2. Спрашиваем ИИ (если подключён)
