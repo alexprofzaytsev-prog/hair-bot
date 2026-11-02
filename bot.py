@@ -15,6 +15,7 @@ import re
 from datetime import date
 from pathlib import Path
 
+import aiohttp
 import anthropic
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -504,11 +505,60 @@ async def answer(message: Message, bot: Bot):
     )
 
 
+# ---------- Автообновление содержимого с GitHub ----------
+# Акции, семинары, прайсы и ответы бот сам забирает из репозитория раз в несколько минут,
+# поэтому после их изменения на GitHub пересобирать бота не нужно.
+CONTENT_URL = "https://raw.githubusercontent.com/alexprofzaytsev-prog/hair-bot/main/"
+CONTENT_FILES = ["knowledge.txt", "price_ids.json", "seminars.json", "promotions.json"]
+SYNC_EVERY_SECONDS = 180
+
+
+async def sync_content() -> list:
+    """Скачивает свежие файлы. Возвращает список обновлённых."""
+    updated = []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        for name in CONTENT_FILES:
+            try:
+                async with session.get(CONTENT_URL + name) as resp:
+                    if resp.status != 200:
+                        continue
+                    text = await resp.text(encoding="utf-8")
+            except Exception as e:
+                logging.warning("Не удалось скачать %s: %s", name, e)
+                continue
+            if name.endswith(".json"):
+                try:
+                    json.loads(text)
+                except ValueError:
+                    logging.warning("Файл %s на GitHub повреждён — оставляю старый", name)
+                    continue
+            path = Path(__file__).with_name(name)
+            if not path.exists() or path.read_text(encoding="utf-8") != text:
+                path.write_text(text, encoding="utf-8")
+                updated.append(name)
+    if "price_ids.json" in updated:
+        price_file_ids.clear()
+        price_file_ids.update(load_price_ids())
+    if updated:
+        logging.info("Обновлено с GitHub: %s", ", ".join(updated))
+    return updated
+
+
+async def sync_content_loop():
+    while True:
+        try:
+            await sync_content()
+        except Exception as e:
+            logging.error("Ошибка автообновления: %s", e)
+        await asyncio.sleep(SYNC_EVERY_SECONDS)
+
+
 async def main():
     if not TELEGRAM_TOKEN:
         raise SystemExit("Не задан TELEGRAM_TOKEN в файле .env")
     bot = Bot(TELEGRAM_TOKEN)
     print("Бот запущен! ИИ:", "включён" if USE_AI else "выключен", "| Остановить: Ctrl+C")
+    asyncio.create_task(sync_content_loop())
     await dp.start_polling(bot)
 
 
